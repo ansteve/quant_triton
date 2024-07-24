@@ -5,10 +5,9 @@ import triton
 from triton import language as tl
 import itertools
 
-import marlin 
-import torch.nn as nn
 # from auto_gptq.modeling._utils import autogptq_post_init
-from auto_gptq.utils.import_utils import dynamically_import_QuantLinear
+# from auto_gptq.utils.import_utils import dynamically_import_QuantLinear
+import kanana_marlin_cuda
 import time
 
 def make_dequant_configs(block_sizes, num_warps):
@@ -21,7 +20,7 @@ def make_dequant_configs(block_sizes, num_warps):
 DEFAULT_DEQUANT_CONFIGS = make_dequant_configs([128, 256, 512, 1024], [4, 8])
 
 
-@triton.autotune(DEFAULT_DEQUANT_CONFIGS, key=["numels"])
+# @triton.autotune(DEFAULT_DEQUANT_CONFIGS, key=["numels"])
 @triton.jit
 def dequant_kernel_248(
     g_idx_ptr,
@@ -153,80 +152,72 @@ if __name__ == '__main__':
     b = make_tensor(k//8, n, dtype=torch.int32)
     c = torch.zeros((m, n), dtype=torch.half, device="cuda")
     g_idx = torch.tensor([i // group_size for i in range(k)], dtype=torch.int32, device="cuda")
+    rand_perm = torch.randperm(k, device="cuda")
     workspace = torch.zeros(n//128*16, device="cuda")
 
-    # zeros = make_tensor(g, n//8, torch.int32)
-    zeros = torch.zeros((g, n//8), dtype=torch.int32, device="cuda")
+    zeros = make_tensor(g, n//8, torch.int32)
+    # zeros = torch.zeros((g, n//8), dtype=torch.int32, device="cuda")
+    # zeros += 8
     scales = make_tensor(g, n, torch.float16)
+    num_groups = scales.shape[0]
+    outfeatures = scales.shape[1]
 
-    # Marlin
-    # m, n, k = 16, 4096, 4096
-    # A = torch.randn((m, k), dtype=torch.half, device="cuda")
-    # B_ref, B, s = gen_quant4(k, n)
-    # C = torch.zeros((m, n), dtype=torch.half, device="cuda")
-    # workspace = torch.zeros(n // 128*16, device="cuda")
-
-    # marlin.mul(a, b, c, scales, workspace, sms=108)
-    output_split_k = quant_matmul_248(a, b, scales, zeros, g_idx, bits=nbits)
-    # assert torch.allclose(c, output_split_k)
-    
-
-    # linear_class = dynamically_import_QuantLinear(
-    # disable_exllama=disable_exllama, disable_exllamav2=disable_exllamav2,
-    # use_triton=use_triton, desc_act=False, group_size=group_size, bits=nbits)
-    linear_class = dynamically_import_QuantLinear(
-        disable_exllama=False, disable_exllamav2=True,
-        use_triton=False, use_tritonv2=False, use_marlin=False, desc_act=False, group_size=group_size, bits=nbits)
-
-    linear = linear_class(
-        bits=nbits,
-        group_size=group_size,
-        infeatures=k,
-        outfeatures=n,
-        bias=0,
-    )
-
-    device = torch.device('cuda')
-
-    # linear.qweight = torch.randint(-100, 100, size=linear.qweight.shape, dtype=torch.int32)
-    # linear.scales = linear.scales + 0.002
-    linear.qweight = b
-    linear.scales = scales
-    linear.qzeros = zeros
-    # linear.B = b
-    # linear.s = scales
-
-    linear = linear.eval().to(device)
-    # linear = autogptq_post_init(linear, use_act_order=False)
-
-    b_fake = torch.randn((k, n), dtype=torch.float16, device="cuda")
+    numels = c.numel()
+    maxq = 2**nbits - 1
+    grid = lambda meta: (triton.cdiv(numels, meta["X_BLOCK"]),)  # noqa: E731
 
     # Warmup
-    for i in range(3):
-        c = linear(a)
-        # marlin.mul(a, b, c, scales, workspace, sms=108)
-        output_split_k = quant_matmul_248(a, b, scales, zeros, g_idx, bits=nbits)
+    for i in range(2):
+        c = kanana_marlin_cuda.gptq_marlin_gemm(a, b, scales, zeros, g_idx, rand_perm, workspace, 4, m, n, k, True, True)
         print(c)
-        print(output_split_k)
+        # marlin.mul(a, b, c, scales, workspace, sms=108)
+        # output_split_k = quant_matmul_248(a, b, scales, zeros, g_idx, bits=nbits)
+        d = torch.zeros((m, n), dtype=torch.half, device="cuda")
+        dequant_kernel_248[grid](
+            g_idx,
+            scales,
+            b,
+            zeros,
+            d,
+            numels,
+            maxq=maxq,
+            bits=nbits,
+            outfeatures=outfeatures,
+            num_groups=num_groups,
+            X_BLOCK=1024,
+        )
+        print(d)
         # assert torch.allclose(c, output_split_k)
-
 
     # Measure linear time
     torch.cuda.synchronize()
     start_time = time.time()
-    for i in range(7):
-        linear(a)
+    for i in range(8):
+        c = kanana_marlin_cuda.gptq_marlin_gemm(a, b, scales, zeros, g_idx, rand_perm, workspace, 4, m, n, k, True, True)
+        # kanana_marlin_cuda.mul(a, b, c, scales, workspace, -1, -1, -1, 16)
         # marlin.mul(a, b, c, scales, workspace, sms=108)
     torch.cuda.synchronize()
     end_time = time.time()
-    print("linear time:", end_time - start_time)
+    print("Marlin time:", end_time - start_time)
 
     # Measure matmul_split_k time
     torch.cuda.synchronize()
     start_time = time.time()
     for i in range(7):
-        quant_matmul_248(a, b, scales, zeros, g_idx, bits=nbits)
+        d = torch.zeros((m, n), dtype=torch.half, device="cuda")
+        dequant_kernel_248[grid](
+            g_idx,
+            scales,
+            b,
+            zeros,
+            d,
+            numels,
+            maxq=maxq,
+            bits=nbits,
+            outfeatures=outfeatures,
+            num_groups=num_groups,
+            X_BLOCK=1024,
+        )
     torch.cuda.synchronize()
     end_time = time.time()
-    print("matmul_split_k time:", end_time - start_time)
-
+    print("dequant_kernel_248 time:", end_time - start_time)
