@@ -6,8 +6,9 @@ import triton
 import my_marlin_cuda
 import time
 
-from dequant import *
-
+# from dequant import *
+# from kernels import *
+from splitk_dequant_gemm import *
 
 def make_tensor(M, N, dtype):
     if dtype == torch.int32:
@@ -48,28 +49,32 @@ if __name__ == '__main__':
 
     # Warmup
     for i in range(2):
+        c = torch.zeros((m, n), dtype=torch.half, device="cuda")
         my_marlin_cuda.mul(a, b, c, scales, workspace, -1, -1, -1, 16)
         print(c)
-        dequant_kernel_248[grid](
-            g_idx,
-            scales,
-            b,
-            zeros,
-            c,
-            numels,
-            maxq=maxq,
-            bits=nbits,
-            outfeatures=outfeatures,
-            num_groups=num_groups,
-            X_BLOCK=1024,
-        )
-        print(c)
+        d = matmul_split_k(a, b, scales, zeros)
+        # d = quant_matmul_inference_only_248(a, b, scales, zeros, g_idx, nbits, maxq)
+        # dequant_kernel_248[grid](
+        #     g_idx,
+        #     scales,
+        #     b,
+        #     zeros,
+        #     c,
+        #     numels,
+        #     maxq=maxq,
+        #     bits=nbits,
+        #     outfeatures=outfeatures,
+        #     num_groups=num_groups,
+        #     X_BLOCK=1024,
+        # )
+        print(d)
         # assert torch.allclose(c, output_split_k)
 
     # Measure marlin time
     torch.cuda.synchronize()
     start_time = time.time()
     for i in range(10):
+        c = torch.zeros((m, n), dtype=torch.half, device="cuda")
         my_marlin_cuda.mul(a, b, c, scales, workspace, -1, -1, -1, 16)
         # marlin.mul(a, b, c, scales, workspace, sms=108)
     torch.cuda.synchronize()
@@ -80,19 +85,7 @@ if __name__ == '__main__':
     torch.cuda.synchronize()
     start_time = time.time()
     for i in range(10):
-        dequant_kernel_248[grid](
-            g_idx,
-            scales,
-            b,
-            zeros,
-            c,
-            numels,
-            maxq=maxq,
-            bits=nbits,
-            outfeatures=outfeatures,
-            num_groups=num_groups,
-            X_BLOCK=1024,
-        )
+        d = matmul_split_k(a, b, scales, zeros)
     torch.cuda.synchronize()
     end_time = time.time()
-    print("dequant_kernel_248 time:", end_time - start_time)
+    print("Triton time:", end_time - start_time)
